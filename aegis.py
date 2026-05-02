@@ -1,5 +1,5 @@
 """
-aegis.py - Aegis-LX v3.0
+aegis.py - Aegis-LX v4.0
 """
 import time, argparse, signal, sys, os
 from datetime import datetime
