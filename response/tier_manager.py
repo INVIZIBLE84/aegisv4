@@ -50,12 +50,12 @@ COOLDOWNS = {4: 300, 3: 240, 2: 180, 1: 120}
 # Map risk level + phase combo → recommended tier
 RISK_TO_TIER = {
     ("LOW",    "SAFE"):        0,
-    ("LOW",    "RECON"):       1,
-    ("MEDIUM", "RECON"):       1,
+    ("LOW",    "RECON"):       1,     # nmap alone → WATCH (visible alert)
+    ("MEDIUM", "RECON"):       2,     # nmap with score → SLOW (CPU throttle)
     ("MEDIUM", "DISCOVERY"):   2,
     ("HIGH",   "RECON"):       2,
     ("MEDIUM", "CREDENTIAL"):  3,
-    ("HIGH",   "DISCOVERY"):   2,
+    ("HIGH",   "DISCOVERY"):   3,
     ("HIGH",   "CREDENTIAL"):  3,
     ("HIGH",   "EXECUTION"):   3,
     ("HIGH",   "PERSISTENCE"): 3,

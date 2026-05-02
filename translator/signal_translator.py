@@ -35,15 +35,15 @@ PHASE_LATERAL     = "LATERAL"
 # ── Process name dictionary ───────────────────────────────────────────────────
 THREAT_DICT = {
     # Recon & Scanning
-    "nmap":        {"weight": 15, "phase": PHASE_RECON,       "mitre": "T1046 (Network Service Discovery)"},
-    "masscan":     {"weight": 18, "phase": PHASE_RECON,       "mitre": "T1046 (Network Service Discovery)"},
-    "zmap":        {"weight": 18, "phase": PHASE_RECON,       "mitre": "T1046 (Network Service Discovery)"},
-    "nuclei":      {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1595 (Active Scanning)"},
-    "nikto":       {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1595 (Active Scanning)"},
-    "gobuster":    {"weight": 18, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
-    "ffuf":        {"weight": 18, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
-    "wfuzz":       {"weight": 18, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
-    "dirbuster":   {"weight": 18, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
+    "nmap":        {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1046 (Network Service Discovery)"},
+    "masscan":     {"weight": 22, "phase": PHASE_RECON,       "mitre": "T1046 (Network Service Discovery)"},
+    "zmap":        {"weight": 22, "phase": PHASE_RECON,       "mitre": "T1046 (Network Service Discovery)"},
+    "nuclei":      {"weight": 22, "phase": PHASE_RECON,       "mitre": "T1595 (Active Scanning)"},
+    "nikto":       {"weight": 22, "phase": PHASE_RECON,       "mitre": "T1595 (Active Scanning)"},
+    "gobuster":    {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
+    "ffuf":        {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
+    "wfuzz":       {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
+    "dirbuster":   {"weight": 20, "phase": PHASE_RECON,       "mitre": "T1083 (File/Dir Discovery)"},
 
     # Discovery
     "linpeas":     {"weight": 28, "phase": PHASE_DISCOVERY,   "mitre": "T1082 (System Information Discovery)"},
@@ -99,7 +99,28 @@ THREAT_DICT = {
     "iptables":    {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
     "ip6tables":   {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
     "cpulimit":    {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
+    # Cron system processes — these run legitimately on every Linux system
+    # run-parts executes scripts in cron.hourly/daily/weekly/monthly automatically
+    "run-parts":   {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
+    "cron":        {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
+    "crond":       {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
+    "anacron":     {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
+    "at":          {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
+    "atd":         {"weight":  0, "phase": PHASE_SAFE,        "mitre": "SAFE"},
 }
+
+# ── Safe command patterns (whitelist — checked BEFORE suspicious args) ────────
+# If a full command matches any of these, ALL scoring is skipped entirely.
+# These are known-legitimate system operations that contain suspicious-looking
+# strings (e.g. cron executing /etc/cron.hourly looks like persistence).
+SAFE_COMMAND_PATTERNS = [
+    "run-parts --report /etc/cron.",   # cron executing its own job dirs
+    "run-parts /etc/cron.",            # alternate cron invocation
+    "/bin/sh -c cd / && run-parts",    # cron launching shell for jobs
+    "SHELL=/bin/sh",                   # cron environment setup
+    "HOME=/root",                      # cron environment variable
+    "anacron -s",                      # anacron running missed jobs
+]
 
 # ── Argument-level threat patterns ────────────────────────────────────────────
 # ALL matches are accumulated — no early break.
@@ -139,9 +160,13 @@ SUSPICIOUS_ARGS = {
     "chmod 4755":      {"weight": 22, "phase": PHASE_EXECUTION,   "mitre": "T1548.001 (SUID Bit Set)"},
     "chown root":      {"weight": 15, "phase": PHASE_EXECUTION,   "mitre": "T1548 (Abuse Elevation Control)"},
 
-    # Persistence
-    "/etc/cron":       {"weight": 18, "phase": PHASE_PERSISTENCE, "mitre": "T1053.003 (Cron Persistence)"},
+    # Persistence — NOTE: match only cron MODIFICATION patterns, not execution
+    # "/etc/cron" removed — too broad, matches legitimate run-parts execution
+    # Use specific modification indicators instead:
     "crontab -e":      {"weight": 15, "phase": PHASE_PERSISTENCE, "mitre": "T1053.003 (Cron Modification)"},
+    "crontab -l":      {"weight":  5, "phase": PHASE_DISCOVERY,   "mitre": "T1053.003 (Cron Listing)"},
+    "/etc/cron.d/":    {"weight": 18, "phase": PHASE_PERSISTENCE, "mitre": "T1053.003 (Cron.d File Write)"},
+    "/var/spool/cron": {"weight": 18, "phase": PHASE_PERSISTENCE, "mitre": "T1053.003 (Spool Cron Write)"},
     ".bashrc":         {"weight": 12, "phase": PHASE_PERSISTENCE, "mitre": "T1546.004 (Bash Profile)"},
     ".bash_profile":   {"weight": 12, "phase": PHASE_PERSISTENCE, "mitre": "T1546.004 (Bash Profile)"},
     "/etc/profile":    {"weight": 15, "phase": PHASE_PERSISTENCE, "mitre": "T1546.004 (Profile Persistence)"},
@@ -168,6 +193,24 @@ def translate_process_to_signals(process_info: dict) -> list:
     weight     = 0
     phase      = PHASE_SAFE
     mitre_tags = []
+
+    # Step 0: Safe command whitelist — skip ALL scoring for known-legitimate commands
+    # Prevents cron hourly/daily/weekly jobs from triggering persistence alerts
+    for safe_pat in SAFE_COMMAND_PATTERNS:
+        if safe_pat in full_command:
+            return [{
+                "signal_type": process_name,
+                "phase":       PHASE_SAFE,
+                "severity":    0,
+                "raw_weight":  0,
+                "mitre":       "SAFE/WHITELISTED",
+                "context": {
+                    "full_cmd":  full_command,
+                    "pid":       process_info.get("pid"),
+                    "user":      process_info.get("user", "unknown"),
+                    "timestamp": process_info.get("timestamp"),
+                }
+            }]
 
     # Step 1: Base command lookup
     if process_name in THREAT_DICT:

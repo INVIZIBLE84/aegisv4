@@ -6,6 +6,7 @@ from datetime import datetime
 from observer.system_observer import collect_process_info, collect_file_events
 from detection.network_engine import NetworkEngine
 from detection.ransomware_engine import RansomwareEngine
+from detection.correlation_engine import CorrelationEngine
 from detection.fim_engine import FIMEngine
 from detection.lineage_engine import LineageEngine
 from translator.signal_translator import translate_process_to_signals
@@ -135,6 +136,28 @@ def print_ransomware_panel(ransom_alerts):
         else:
             print("  " + RE + "|" + R + "    " + DIM + a["detail"][:65] + R)
     print("  " + RE + "+" + "-"*50 + R)
+
+
+def print_correlation_panel(corr_alerts, correlation_engine):
+    summary = correlation_engine.get_window_summary()
+    print("\n  " + M + "+-- ALERT CORRELATION ENGINE (90s window)" + R)
+    print("  " + M + "|" + R + "  " + DIM + summary + R)
+    if not corr_alerts:
+        print("  " + M + "|" + R + "  " + G + "No correlated threat patterns detected" + R)
+    for a in corr_alerts:
+        tc = RE if a["tier"] >= 4 else Y
+        engines = ", ".join(a["engines_fired"])
+        phases  = " + ".join(a["phases_seen"])
+        print("  " + M + "|" + R + "  " + tc + B + "! COMPOSITE THREAT DETECTED" + R)
+        print("  " + M + "|" + R + "  " + tc + "  Engines: " + engines + R)
+        print("  " + M + "|" + R + "  " + tc + "  Phases:  " + phases + R)
+        if a.get("chain_match"):
+            print("  " + M + "|" + R + "  " + RE + B +
+                  "  KILL CHAIN CONFIRMED: " + str(a["chain_match"]) + R)
+        print("  " + M + "|" + R + "  " + DIM +
+              "  Signals: " + str(a["signal_count"]) +
+              "  Composite Tier: " + str(a["tier"]) + R)
+    print("  " + M + "+" + "-"*50 + R)
 
 
 PHASE_ORDER = ["RECON","DISCOVERY","CREDENTIAL","EXECUTION","PERSISTENCE","EXFILTRATION","LATERAL"]
@@ -282,6 +305,27 @@ def run_demo(logger):
                                   net_change["reason"], [])
                 logger.log_tier_change(net_change)
 
+        # CORRELATION: feed all engine alerts into correlation engine
+        correlation_engine.ingest("SIGNATURE", sig_result.get("hits", []))
+        correlation_engine.ingest("FIM",       fim_alerts)
+        correlation_engine.ingest("RANSOMWARE",ransom_alerts)
+        corr_alerts = correlation_engine.analyze()
+
+        for alert in corr_alerts:
+            logger.log_risk({"tier": alert["tier"], "stat_level": "CORRELATION",
+                             "sig_score": 0, "phases": alert["phases_seen"],
+                             "corr_detail": alert["detail"]})
+            if alert["tier"] > tier_manager.current:
+                cc = tier_manager._escalate_to(
+                    alert["tier"],
+                    "[CORR] " + alert["detail"][:80],
+                    __import__('time').time()
+                )
+                apply_tier(cc["new_tier"], cc["old_tier"], [])
+                alert_tier_change(cc["old_tier"], cc["new_tier"],
+                                  cc["reason"], [])
+                logger.log_tier_change(cc)
+
         change      = tier_manager.evaluate(stat_report, sig_result)
         if change["changed"]:
             apply_tier(change["new_tier"], change["old_tier"], sig_result["hits"])
@@ -292,6 +336,7 @@ def run_demo(logger):
         print_sig_panel(sig_result)
         print_fim_panel(fim_alerts)
         print_ransomware_panel(ransom_alerts)
+        print_correlation_panel(corr_alerts, correlation_engine)
         print_lineage_panel(lineage_alerts)
         print_network_panel(net_alerts)
         print_killchain_panel(sig_result, tier_manager)
@@ -310,8 +355,9 @@ def run_monitor(logger):
     fim_engine     = FIMEngine()
     lineage_engine  = LineageEngine()
     network_engine     = NetworkEngine()
-    ransomware_engine  = RansomwareEngine()
-    tier_manager       = TierManager()
+    ransomware_engine   = RansomwareEngine()
+    correlation_engine  = CorrelationEngine()
+    tier_manager        = TierManager()
     cycle        = 0
 
     def on_exit(sig, frame):
@@ -329,9 +375,13 @@ def run_monitor(logger):
             apply_tier(5, tier_manager.current, [])
             alert_tier_change(change["old_tier"], 5, "Manual lockdown", [])
             logger.log_tier_change(change)
-        if not os.path.exists(".aegis_lockdown") and tier_manager.lockdown_manual:
+        # Release: if flag file gone but we're still at tier 5, step down
+        # Check tier == 5 directly — don't depend on lockdown_manual flag
+        # which can get out of sync if monitor was restarted
+        if not os.path.exists(".aegis_lockdown") and tier_manager.current == 5:
             change = tier_manager.manual_release()
             apply_tier(change["new_tier"], 5, [])
+            alert_tier_change(5, change["new_tier"], "Manual release detected", [])
             logger.log_tier_change(change)
         raw = collect_process_info()
         signals = []
@@ -384,26 +434,40 @@ def run_monitor(logger):
         time.sleep(10)
 
 def run_lockdown(logger):
-    from response.response_engine import _escalate
     print("\n  " + M + B + "MANUAL LOCKDOWN REQUESTED" + R)
-    confirm = input("  " + Y + "Type CONFIRM to proceed: " + R).strip()
+    confirm = input("  " + Y + "Type CONFIRM to proceed with Tier 5 Lockdown: " + R).strip()
     if confirm != "CONFIRM":
         print("  " + G + "Lockdown cancelled." + R)
         return
     with open(".aegis_lockdown", "w") as f:
         f.write("MANUAL")
-    print("  " + M + B + "Tier 5 LOCKDOWN activated." + R)
+    print("  " + M + B + "Tier 5 LOCKDOWN flag set." + R)
+    print("  " + Y + "Monitor loop will enforce within 10 seconds." + R)
     print("  " + DIM + "To release: sudo python3 aegis.py --release" + R + "\n")
     notify(5, "Aegis-LX LOCKDOWN", "Manual Tier 5 Lockdown activated by operator")
-    _escalate(5, [])
+    # NOTE: Do NOT call _escalate here — that would add duplicate iptables rules.
+    # The monitor loop detects the flag file and handles escalation itself.
 
 def run_release():
+    import subprocess as _sp
+    removed = False
     if os.path.exists(".aegis_lockdown"):
         os.remove(".aegis_lockdown")
-        print("\n  " + G + B + "Lockdown flag removed. Monitor stepping down to Tier 4." + R + "\n")
+        removed = True
+
+    # Flush ALL iptables OUTPUT rules regardless of flag state
+    # This is the nuclear option for release — clears any duplicate rules too
+    try:
+        _sp.run(["iptables", "-F", "OUTPUT"], stderr=_sp.DEVNULL)
+        print("\n  " + G + B + "iptables OUTPUT chain flushed — all blocks cleared." + R)
+    except Exception as e:
+        print("  " + Y + "iptables flush failed: " + str(e)[:50] + R)
+
+    if removed:
+        print("  " + G + B + "Lockdown flag removed. Monitor will step down." + R + "\n")
         notify(1, "Aegis-LX Released", "Manual lockdown released by operator")
     else:
-        print("  " + Y + "No manual lockdown active." + R)
+        print("  " + Y + "No lockdown flag found — but iptables flushed anyway." + R + "\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Aegis-LX v3.0")
